@@ -34,19 +34,18 @@ async function main() {
   if (
     !meta ||
     typeof meta.regularMarketPrice !== 'number' ||
-    typeof meta.previousClose !== 'number'
+    typeof meta.regularMarketChangePercent !== 'number'
   ) {
     // Log the raw response so the Actions log shows exactly what Yahoo sent
     // back — this is what we need to see to diagnose an unexpected shape.
     console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
     throw new Error(
-      'Unexpected response shape from Yahoo Finance — no usable meta.regularMarketPrice/previousClose.'
+      'Unexpected response shape from Yahoo Finance — no usable meta.regularMarketPrice/regularMarketChangePercent.'
     );
   }
 
   const close = meta.regularMarketPrice;
-  const changePct =
-    ((meta.regularMarketPrice - meta.previousClose) / meta.previousClose) * 100;
+  const changePct = meta.regularMarketChangePercent;
 
   const line = `${close.toFixed(2)},${changePct.toFixed(2)}`;
 

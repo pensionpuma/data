@@ -1,0 +1,39 @@
+name: Update FTSE 100 close
+
+on:
+  schedule:
+    # 18:00 UTC, Monday–Friday — safely after the LSE's 16:30 UK close in
+    # both GMT and BST, and skips weekends when the market doesn't trade.
+    - cron: '0 18 * * 1-5'
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab
+
+# Needed so the workflow can push the updated file back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  update-ftse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch FTSE 100 data and write ftse.txt
+        run: node scripts/update-ftse.mjs
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- ftse.txt; then
+            git add ftse.txt
+            git commit -m "Update FTSE 100 close ($(date -u +'%Y-%m-%d'))"
+            git push
+          else
+            echo "No change in ftse.txt — nothing to commit."
+          fi

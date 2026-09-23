@@ -12,18 +12,24 @@
 // decide whether to say "today", "yesterday", or a weekday name (e.g. after a
 // weekend or a bank holiday with no new session in between).
 //
-// This always reports the most recently COMPLETED session's close — today's
-// bar (if present) is always excluded, since while the market is open it's
-// only a live, still-changing price, never a real close.
+// This always reports the most recently COMPLETED session's close.
 //
-// Yahoo's chart data has occasionally been observed to return `close: null`
-// for the most recent completed day (a backend data gap, not a holiday —
-// seen even many hours after that session actually closed). To work around
-// this, a short "5d" request is tried first; if the freshest completed day
-// in that response is null, a wider "1mo" request is tried as well, and
-// whichever attempt yields the more recent valid close wins. If a gap is
-// still unresolved after both, it falls back to the most recent valid close
-// available and logs a warning — this should be rare.
+// IMPORTANT: "today's" bar is only excluded while the market is still open
+// (checked against meta.currentTradingPeriod.regular.end) — NOT unconditionally.
+// An earlier version of this script always dropped whatever bar was dated
+// "today", which is wrong: this script runs on a schedule that fires on the
+// same calendar day it's reporting on (18:00 UTC, safely after the 16:30 UK
+// close), so "today" IS the day whose close we actually want to report once
+// the session has ended. Unconditionally excluding it meant the scheduled run
+// could never report its own day's close and was always at least one day
+// stale, even with no data gaps at all.
+//
+// Yahoo's chart data has also occasionally been observed to return
+// `close: null` for a specific completed day (a backend data gap, not a
+// holiday). To work around that separately, a short "5d" request is tried
+// first; if the freshest completed day in that response is null, a wider
+// "1mo" request is also tried, and whichever attempt yields the more recent
+// valid close wins.
 //
 // Dates are assembled manually from Intl.DateTimeFormat's individual
 // year/month/day parts (formatToParts), not from its combined string output,
@@ -57,7 +63,7 @@ function londonDateString(msTimestamp) {
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
-async function fetchDailyBars(range) {
+async function fetchDailyBars(range, { excludeToday }) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/%5EFTSE?range=${range}&interval=1d`;
   const res = await fetch(url, { headers: HEADERS });
   if (!res.ok) {
@@ -72,15 +78,13 @@ async function fetchDailyBars(range) {
     throw new Error(`Unexpected response shape from Yahoo Finance (range=${range}).`);
   }
 
-  // Build date -> close, excluding today entirely (never a real close while
-  // the market's open) and excluding null/undefined entries (data gaps).
   const todayStr = londonDateString(Date.now());
   const byDate = new Map();
   for (let i = 0; i < timestamps.length; i++) {
     const dateStr = londonDateString(timestamps[i] * 1000);
     const close = closes[i];
-    if (dateStr === todayStr) continue;
-    if (close === null || close === undefined) continue;
+    if (excludeToday && dateStr === todayStr) continue; // still-forming live price, not a real close
+    if (close === null || close === undefined) continue; // data gap
     byDate.set(dateStr, close);
   }
   return byDate;
@@ -98,20 +102,38 @@ function pickTargetAndPrevious(byDate) {
   };
 }
 
+async function getMarketMeta() {
+  const url = 'https://query1.finance.yahoo.com/v8/finance/chart/%5EFTSE?range=1d&interval=1d';
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Yahoo Finance meta request failed: HTTP ${res.status}`);
+  const data = await res.json();
+  const meta = data?.chart?.result?.[0]?.meta;
+  if (!meta) {
+    console.error('Raw response from Yahoo (meta check):', JSON.stringify(data, null, 2));
+    throw new Error('Unexpected response shape from Yahoo Finance (meta check).');
+  }
+  return meta;
+}
+
 async function main() {
+  const meta = await getMarketMeta();
+  const sessionEnd = meta.currentTradingPeriod?.regular?.end;
+  const sessionHasEnded = typeof sessionEnd === 'number' ? Date.now() / 1000 >= sessionEnd : true;
+  // Only treat "today" as off-limits while the market is still open — once
+  // the session has ended, today's own close is exactly what we want.
+  const excludeToday = !sessionHasEnded;
+  console.log(`sessionHasEnded=${sessionHasEnded} (excludeToday=${excludeToday})`);
+
   console.log('Attempt 1: range=5d');
-  const shortRangeBars = await fetchDailyBars('5d');
-  console.log('5d bars (today + null closes excluded):', Object.fromEntries(shortRangeBars));
+  const shortRangeBars = await fetchDailyBars('5d', { excludeToday });
+  console.log('5d bars (null closes excluded):', Object.fromEntries(shortRangeBars));
   let picked = pickTargetAndPrevious(shortRangeBars);
 
-  // If we didn't get a usable pair from the short range (or want to double
-  // check we're not missing a fresher value due to a data gap), also try a
-  // wider range and prefer whichever gives the more recent target date.
   console.log('Attempt 2: range=1mo (checked for a fresher/more complete value)');
   let widerBars;
   try {
-    widerBars = await fetchDailyBars('1mo');
-    console.log('1mo bars, most recent 5 (today + null closes excluded):',
+    widerBars = await fetchDailyBars('1mo', { excludeToday });
+    console.log('1mo bars, most recent 5 (null closes excluded):',
       Object.fromEntries(Array.from(widerBars).slice(-5)));
   } catch (err) {
     console.warn('Wider-range (1mo) fetch failed, continuing with 5d result only:', err);

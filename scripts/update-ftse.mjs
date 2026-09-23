@@ -12,6 +12,15 @@
 // decide whether to say "today", "yesterday", or a weekday name (e.g. after a
 // weekend or a bank holiday with no new session in between).
 //
+// IMPORTANT: this always reports the most recently COMPLETED session's close
+// — never an in-progress intraday price — regardless of what time of day this
+// script happens to run. If it runs while the market is still open (a manual
+// trigger, a delayed cron run, etc.), meta.regularMarketPrice would be a live,
+// still-changing price for *today*, not a real close, so we explicitly check
+// whether today's session has actually ended before trusting it; if it hasn't,
+// we step back to the last genuinely finished close instead (usually
+// yesterday's, or the last trading day's if there's been a weekend/holiday).
+//
 // This runs server-side (in GitHub Actions), NOT in a browser — so none of
 // the CORS or bot-blocking issues that ruled out client-side proxies apply
 // here. Requires Node.js 18+ (built-in fetch). No npm packages needed.
@@ -27,6 +36,15 @@ const HEADERS = {
   Accept: 'application/json',
 };
 
+function londonDateString(msTimestamp) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/London',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(msTimestamp));
+}
+
 async function main() {
   const res = await fetch(YAHOO_URL, { headers: HEADERS });
   if (!res.ok) {
@@ -34,35 +52,47 @@ async function main() {
   }
 
   const data = await res.json();
-  const meta = data?.chart?.result?.[0]?.meta;
+  const result = data?.chart?.result?.[0];
+  const meta = result?.meta;
+  const timestamps = result?.timestamp;
+  const closes = result?.indicators?.quote?.[0]?.close;
 
-  if (
-    !meta ||
-    typeof meta.regularMarketPrice !== 'number' ||
-    typeof meta.regularMarketChangePercent !== 'number' ||
-    typeof meta.regularMarketTime !== 'number'
-  ) {
+  if (!meta || !Array.isArray(timestamps) || !Array.isArray(closes) || timestamps.length === 0) {
     // Log the raw response so the Actions log shows exactly what Yahoo sent
     // back — this is what we need to see to diagnose an unexpected shape.
     console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
-    throw new Error(
-      'Unexpected response shape from Yahoo Finance — no usable meta.regularMarketPrice/regularMarketChangePercent/regularMarketTime.'
-    );
+    throw new Error('Unexpected response shape from Yahoo Finance — no usable timestamp/close series.');
   }
 
-  const close = meta.regularMarketPrice;
-  const changePct = meta.regularMarketChangePercent;
+  const nowMs = Date.now();
+  const lastIdx = closes.length - 1;
+  const lastBarIsToday = londonDateString(timestamps[lastIdx] * 1000) === londonDateString(nowMs);
 
-  // regularMarketTime is a Unix timestamp (seconds) for the most recent
-  // session's close. Convert it to an Europe/London calendar date (handles
-  // the GMT/BST switch automatically) so the site can compare it against
-  // "today" in the same timezone the market actually trades in.
-  const tradingDate = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Europe/London',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date(meta.regularMarketTime * 1000));
+  // If today's session hasn't actually finished yet, the last bar is a live,
+  // still-forming price — not a real close — so skip it and use the previous
+  // bar instead. If currentTradingPeriod isn't present for some reason, we
+  // fall back to trusting the last bar (matches the previous behaviour).
+  const sessionEnd = meta.currentTradingPeriod?.regular?.end;
+  const sessionHasEnded = typeof sessionEnd === 'number' ? nowMs / 1000 >= sessionEnd : true;
+  const skipLastBar = lastBarIsToday && !sessionHasEnded;
+
+  let closeIdx = skipLastBar ? lastIdx - 1 : lastIdx;
+  // Walk back past any trailing null/undefined entries (a data gap, or a
+  // still-forming bar) to make sure we land on a genuine, finalized close.
+  while (closeIdx >= 0 && (closes[closeIdx] === null || closes[closeIdx] === undefined)) {
+    closeIdx -= 1;
+  }
+  const prevIdx = closeIdx - 1;
+
+  if (closeIdx < 1 || closes[prevIdx] === null || closes[prevIdx] === undefined) {
+    console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
+    throw new Error('Not enough completed daily closes in the response to compute a change.');
+  }
+
+  const close = closes[closeIdx];
+  const previousClose = closes[prevIdx];
+  const changePct = ((close - previousClose) / previousClose) * 100;
+  const tradingDate = londonDateString(timestamps[closeIdx] * 1000);
 
   const line = `${close.toFixed(2)},${changePct.toFixed(2)},${tradingDate}`;
 

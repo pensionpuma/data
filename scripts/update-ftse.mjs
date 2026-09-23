@@ -12,29 +12,28 @@
 // decide whether to say "today", "yesterday", or a weekday name (e.g. after a
 // weekend or a bank holiday with no new session in between).
 //
-// IMPORTANT: this always reports the most recently COMPLETED session's close
-// — never an in-progress intraday price — regardless of what time of day this
-// script happens to run. If it runs while the market is still open (a manual
-// trigger, a delayed cron run, etc.), meta.regularMarketPrice would be a live,
-// still-changing price for *today*, not a real close, so we explicitly check
-// whether today's session has actually ended before trusting it; if it hasn't,
-// we step back to the last genuinely finished close instead.
+// This always reports the most recently COMPLETED session's close — today's
+// bar (if present) is always excluded, since while the market is open it's
+// only a live, still-changing price, never a real close.
+//
+// Yahoo's chart data has occasionally been observed to return `close: null`
+// for the most recent completed day (a backend data gap, not a holiday —
+// seen even many hours after that session actually closed). To work around
+// this, a short "5d" request is tried first; if the freshest completed day
+// in that response is null, a wider "1mo" request is tried as well, and
+// whichever attempt yields the more recent valid close wins. If a gap is
+// still unresolved after both, it falls back to the most recent valid close
+// available and logs a warning — this should be rare.
 //
 // Dates are assembled manually from Intl.DateTimeFormat's individual
-// year/month/day parts (formatToParts), NOT from its combined string output
-// (e.g. the 'en-CA' locale's YYYY-MM-DD rendering) — combined date-string
-// output can behave inconsistently across JS engines/ICU versions, which was
-// causing "is this bar today?" comparisons to misfire. Extracting the parts
-// individually and joining them ourselves sidesteps that entirely.
+// year/month/day parts (formatToParts), not from its combined string output,
+// since combined-string formatting can behave inconsistently across
+// JS engines/ICU versions.
 //
 // This runs server-side (in GitHub Actions), NOT in a browser — so none of
 // the CORS or bot-blocking issues that ruled out client-side proxies apply
 // here. Requires Node.js 18+ (built-in fetch). No npm packages needed.
 
-const YAHOO_URL =
-  'https://query1.finance.yahoo.com/v8/finance/chart/%5EFTSE?range=5d&interval=1d';
-
-// A real browser User-Agent avoids Yahoo's basic bot filtering.
 const HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -58,69 +57,83 @@ function londonDateString(msTimestamp) {
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
-async function main() {
-  const res = await fetch(YAHOO_URL, { headers: HEADERS });
+async function fetchDailyBars(range) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/%5EFTSE?range=${range}&interval=1d`;
+  const res = await fetch(url, { headers: HEADERS });
   if (!res.ok) {
-    throw new Error(`Yahoo Finance request failed: HTTP ${res.status}`);
+    throw new Error(`Yahoo Finance request failed (range=${range}): HTTP ${res.status}`);
   }
-
   const data = await res.json();
   const result = data?.chart?.result?.[0];
-  const meta = result?.meta;
   const timestamps = result?.timestamp;
   const closes = result?.indicators?.quote?.[0]?.close;
-
-  if (!meta || !Array.isArray(timestamps) || !Array.isArray(closes) || timestamps.length === 0) {
-    console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
-    throw new Error('Unexpected response shape from Yahoo Finance — no usable timestamp/close series.');
+  if (!Array.isArray(timestamps) || !Array.isArray(closes) || timestamps.length === 0) {
+    console.error(`Raw response from Yahoo (range=${range}):`, JSON.stringify(data, null, 2));
+    throw new Error(`Unexpected response shape from Yahoo Finance (range=${range}).`);
   }
 
-  // Diagnostic dump: every bar's index, timestamp, London date, and close —
-  // so if the selection below ever looks wrong again, the log shows exactly
-  // what data we had to choose from.
-  console.log(
-    'Daily bars received:',
-    timestamps.map((ts, i) => ({
-      index: i,
-      date: londonDateString(ts * 1000),
-      close: closes[i],
-    }))
-  );
-
-  const nowMs = Date.now();
-  const todayStr = londonDateString(nowMs);
-  const lastIdx = closes.length - 1;
-  const lastBarDateStr = londonDateString(timestamps[lastIdx] * 1000);
-  const lastBarIsToday = lastBarDateStr === todayStr;
-
-  const sessionEnd = meta.currentTradingPeriod?.regular?.end;
-  const sessionHasEnded = typeof sessionEnd === 'number' ? nowMs / 1000 >= sessionEnd : true;
-  const skipLastBar = lastBarIsToday && !sessionHasEnded;
-
-  console.log(
-    `today=${todayStr} lastBarDate=${lastBarDateStr} lastBarIsToday=${lastBarIsToday} ` +
-      `sessionHasEnded=${sessionHasEnded} skipLastBar=${skipLastBar}`
-  );
-
-  let closeIdx = skipLastBar ? lastIdx - 1 : lastIdx;
-  // Walk back past any trailing null/undefined entries (a data gap, or a
-  // still-forming bar) to make sure we land on a genuine, finalized close.
-  while (closeIdx >= 0 && (closes[closeIdx] === null || closes[closeIdx] === undefined)) {
-    closeIdx -= 1;
+  // Build date -> close, excluding today entirely (never a real close while
+  // the market's open) and excluding null/undefined entries (data gaps).
+  const todayStr = londonDateString(Date.now());
+  const byDate = new Map();
+  for (let i = 0; i < timestamps.length; i++) {
+    const dateStr = londonDateString(timestamps[i] * 1000);
+    const close = closes[i];
+    if (dateStr === todayStr) continue;
+    if (close === null || close === undefined) continue;
+    byDate.set(dateStr, close);
   }
-  const prevIdx = closeIdx - 1;
+  return byDate;
+}
 
-  if (closeIdx < 1 || closes[prevIdx] === null || closes[prevIdx] === undefined) {
-    console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
-    throw new Error('Not enough completed daily closes in the response to compute a change.');
+function pickTargetAndPrevious(byDate) {
+  const dates = Array.from(byDate.keys()).sort(); // ISO strings sort chronologically
+  if (dates.length < 2) return null;
+  const targetDate = dates[dates.length - 1];
+  const prevDate = dates[dates.length - 2];
+  return {
+    targetDate,
+    targetClose: byDate.get(targetDate),
+    prevClose: byDate.get(prevDate),
+  };
+}
+
+async function main() {
+  console.log('Attempt 1: range=5d');
+  const shortRangeBars = await fetchDailyBars('5d');
+  console.log('5d bars (today + null closes excluded):', Object.fromEntries(shortRangeBars));
+  let picked = pickTargetAndPrevious(shortRangeBars);
+
+  // If we didn't get a usable pair from the short range (or want to double
+  // check we're not missing a fresher value due to a data gap), also try a
+  // wider range and prefer whichever gives the more recent target date.
+  console.log('Attempt 2: range=1mo (checked for a fresher/more complete value)');
+  let widerBars;
+  try {
+    widerBars = await fetchDailyBars('1mo');
+    console.log('1mo bars, most recent 5 (today + null closes excluded):',
+      Object.fromEntries(Array.from(widerBars).slice(-5)));
+  } catch (err) {
+    console.warn('Wider-range (1mo) fetch failed, continuing with 5d result only:', err);
+    widerBars = null;
   }
 
-  const close = closes[closeIdx];
-  const previousClose = closes[prevIdx];
-  const changePct = ((close - previousClose) / previousClose) * 100;
-  const tradingDate = londonDateString(timestamps[closeIdx] * 1000);
+  if (widerBars) {
+    const widerPicked = pickTargetAndPrevious(widerBars);
+    if (widerPicked && (!picked || widerPicked.targetDate > picked.targetDate)) {
+      picked = widerPicked;
+    }
+  }
 
-  const line = `${close.toFixed(2)},${changePct.toFixed(2)},${tradingDate}`;
+  if (!picked) {
+    throw new Error('Could not find two consecutive completed daily closes from either range attempt.');
+  }
+
+  const { targetDate, targetClose, prevClose } = picked;
+  const changePct = ((targetClose - prevClose) / prevClose) * 100;
+  const line = `${targetClose.toFixed(2)},${changePct.toFixed(2)},${targetDate}`;
+
+  console.log(`Selected: ${line}`);
 
   const fs = await import('node:fs/promises');
   await fs.writeFile('ftse.txt', line + '\n', 'utf8');

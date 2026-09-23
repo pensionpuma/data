@@ -18,8 +18,14 @@
 // trigger, a delayed cron run, etc.), meta.regularMarketPrice would be a live,
 // still-changing price for *today*, not a real close, so we explicitly check
 // whether today's session has actually ended before trusting it; if it hasn't,
-// we step back to the last genuinely finished close instead (usually
-// yesterday's, or the last trading day's if there's been a weekend/holiday).
+// we step back to the last genuinely finished close instead.
+//
+// Dates are assembled manually from Intl.DateTimeFormat's individual
+// year/month/day parts (formatToParts), NOT from its combined string output
+// (e.g. the 'en-CA' locale's YYYY-MM-DD rendering) — combined date-string
+// output can behave inconsistently across JS engines/ICU versions, which was
+// causing "is this bar today?" comparisons to misfire. Extracting the parts
+// individually and joining them ourselves sidesteps that entirely.
 //
 // This runs server-side (in GitHub Actions), NOT in a browser — so none of
 // the CORS or bot-blocking issues that ruled out client-side proxies apply
@@ -36,13 +42,20 @@ const HEADERS = {
   Accept: 'application/json',
 };
 
+const LONDON_PARTS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/London',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+// Returns an Europe/London calendar date as "YYYY-MM-DD", built from
+// individually-extracted parts rather than trusting a locale's combined
+// string output.
 function londonDateString(msTimestamp) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Europe/London',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date(msTimestamp));
+  const parts = LONDON_PARTS_FORMATTER.formatToParts(new Date(msTimestamp));
+  const get = (type) => parts.find((p) => p.type === type).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
 async function main() {
@@ -58,23 +71,36 @@ async function main() {
   const closes = result?.indicators?.quote?.[0]?.close;
 
   if (!meta || !Array.isArray(timestamps) || !Array.isArray(closes) || timestamps.length === 0) {
-    // Log the raw response so the Actions log shows exactly what Yahoo sent
-    // back — this is what we need to see to diagnose an unexpected shape.
     console.error('Raw response from Yahoo:', JSON.stringify(data, null, 2));
     throw new Error('Unexpected response shape from Yahoo Finance — no usable timestamp/close series.');
   }
 
-  const nowMs = Date.now();
-  const lastIdx = closes.length - 1;
-  const lastBarIsToday = londonDateString(timestamps[lastIdx] * 1000) === londonDateString(nowMs);
+  // Diagnostic dump: every bar's index, timestamp, London date, and close —
+  // so if the selection below ever looks wrong again, the log shows exactly
+  // what data we had to choose from.
+  console.log(
+    'Daily bars received:',
+    timestamps.map((ts, i) => ({
+      index: i,
+      date: londonDateString(ts * 1000),
+      close: closes[i],
+    }))
+  );
 
-  // If today's session hasn't actually finished yet, the last bar is a live,
-  // still-forming price — not a real close — so skip it and use the previous
-  // bar instead. If currentTradingPeriod isn't present for some reason, we
-  // fall back to trusting the last bar (matches the previous behaviour).
+  const nowMs = Date.now();
+  const todayStr = londonDateString(nowMs);
+  const lastIdx = closes.length - 1;
+  const lastBarDateStr = londonDateString(timestamps[lastIdx] * 1000);
+  const lastBarIsToday = lastBarDateStr === todayStr;
+
   const sessionEnd = meta.currentTradingPeriod?.regular?.end;
   const sessionHasEnded = typeof sessionEnd === 'number' ? nowMs / 1000 >= sessionEnd : true;
   const skipLastBar = lastBarIsToday && !sessionHasEnded;
+
+  console.log(
+    `today=${todayStr} lastBarDate=${lastBarDateStr} lastBarIsToday=${lastBarIsToday} ` +
+      `sessionHasEnded=${sessionHasEnded} skipLastBar=${skipLastBar}`
+  );
 
   let closeIdx = skipLastBar ? lastIdx - 1 : lastIdx;
   // Walk back past any trailing null/undefined entries (a data gap, or a

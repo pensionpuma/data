@@ -2,9 +2,19 @@ name: Update FTSE 100 close
 
 on:
   schedule:
-    # 18:00 UTC, Monday–Friday — safely after the LSE's 16:30 UK close in
-    # both GMT and BST, and skips weekends when the market doesn't trade.
-    - cron: '0 18 * * 1-5'
+    # 16:45 UK local time, Monday–Friday — 15 minutes after the LSE's 16:30
+    # close. GitHub Actions cron always runs in UTC and doesn't shift for
+    # daylight saving, so two schedules are used to keep this pinned to
+    # 16:45 UK time year-round: one for BST months (UTC+1) and one for GMT
+    # months (UTC+0). The cutover here is the calendar month boundary rather
+    # than the exact last-Sunday-of-March/October transition (cron can't
+    # express that precisely) — during that one transition week the trigger
+    # may land up to an hour early or late, which is harmless: the script
+    # only accepts a day's close once Yahoo confirms that session has
+    # actually ended, and safely falls back to the previous valid close
+    # otherwise.
+    - cron: '45 15 4-9 * 1-5'             # BST (UTC+1): Apr–Sep, 15:45 UTC = 16:45 BST
+    - cron: '45 16 10,11,12,1,2,3 * 1-5'  # GMT (UTC+0): Oct–Mar, 16:45 UTC = 16:45 GMT
   workflow_dispatch: {} # lets you trigger it manually from the Actions tab
 
 # Needed so the workflow can push the updated file back to the repo.

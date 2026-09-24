@@ -14,22 +14,30 @@
 //
 // This always reports the most recently COMPLETED session's close.
 //
-// IMPORTANT: "today's" bar is only excluded while the market is still open
-// (checked against meta.currentTradingPeriod.regular.end) — NOT unconditionally.
-// An earlier version of this script always dropped whatever bar was dated
-// "today", which is wrong: this script runs on a schedule that fires on the
-// same calendar day it's reporting on (18:00 UTC, safely after the 16:30 UK
-// close), so "today" IS the day whose close we actually want to report once
-// the session has ended. Unconditionally excluding it meant the scheduled run
-// could never report its own day's close and was always at least one day
-// stale, even with no data gaps at all.
+// "Today's" bar is only excluded from consideration while the market is
+// still open (checked against meta.currentTradingPeriod.regular.end) — NOT
+// unconditionally. The scheduled run fires on the same calendar day it's
+// reporting on (18:00 UTC, safely after the 16:30 UK close), so "today" IS
+// the day whose close we want once the session has ended.
 //
-// Yahoo's chart data has also occasionally been observed to return
+// Yahoo's historical chart series has been observed to occasionally return
 // `close: null` for a specific completed day (a backend data gap, not a
-// holiday). To work around that separately, a short "5d" request is tried
-// first; if the freshest completed day in that response is null, a wider
-// "1mo" request is also tried, and whichever attempt yields the more recent
-// valid close wins.
+// holiday) even long after that session closed. A short "5d" request is
+// tried first; if the freshest completed day is null there, a wider "1mo"
+// request is also tried, and whichever gives the more recent valid close
+// wins. But this gap causes a second, subtler problem: if the day *before*
+// our target is the one that's null, computing the day's % change from the
+// array means comparing against a stale, older close (e.g. Monday's instead
+// of Tuesday's), giving a badly wrong percentage even though the target
+// day's own price is correct.
+//
+// To avoid that, whenever our target day is the same day as Yahoo's own
+// live-quote data (meta.regularMarketTime) AND that session has ended,
+// meta.regularMarketChangePercent is used instead — it's computed by Yahoo
+// internally from their live-quote pipeline, a separate, more reliably
+// up-to-date data path than the historical chart series that has the gap.
+// The array-derived change is only used as a fallback for older target days
+// (e.g. after a weekend/holiday) where no live-quote figure applies.
 //
 // Dates are assembled manually from Intl.DateTimeFormat's individual
 // year/month/day parts (formatToParts), not from its combined string output,
@@ -119,8 +127,6 @@ async function main() {
   const meta = await getMarketMeta();
   const sessionEnd = meta.currentTradingPeriod?.regular?.end;
   const sessionHasEnded = typeof sessionEnd === 'number' ? Date.now() / 1000 >= sessionEnd : true;
-  // Only treat "today" as off-limits while the market is still open — once
-  // the session has ended, today's own close is exactly what we want.
   const excludeToday = !sessionHasEnded;
   console.log(`sessionHasEnded=${sessionHasEnded} (excludeToday=${excludeToday})`);
 
@@ -151,10 +157,29 @@ async function main() {
     throw new Error('Could not find two consecutive completed daily closes from either range attempt.');
   }
 
-  const { targetDate, targetClose, prevClose } = picked;
-  const changePct = ((targetClose - prevClose) / prevClose) * 100;
-  const line = `${targetClose.toFixed(2)},${changePct.toFixed(2)},${targetDate}`;
+  let { targetDate, targetClose, prevClose } = picked;
+  let changePct = ((targetClose - prevClose) / prevClose) * 100;
+  let changeSource = 'array (target vs previous completed close)';
 
+  // Prefer Yahoo's own live-quote % change when it applies to the same day
+  // we're reporting on and that session has ended — sidesteps the
+  // historical-array gap entirely for the common case (reporting on the
+  // latest session).
+  if (
+    sessionHasEnded &&
+    typeof meta.regularMarketTime === 'number' &&
+    typeof meta.regularMarketChangePercent === 'number' &&
+    typeof meta.regularMarketPrice === 'number' &&
+    londonDateString(meta.regularMarketTime * 1000) === targetDate
+  ) {
+    targetClose = meta.regularMarketPrice;
+    changePct = meta.regularMarketChangePercent;
+    changeSource = 'meta.regularMarketChangePercent (Yahoo live-quote figure)';
+  }
+
+  console.log(`Change % source: ${changeSource}`);
+
+  const line = `${targetClose.toFixed(2)},${changePct.toFixed(2)},${targetDate}`;
   console.log(`Selected: ${line}`);
 
   const fs = await import('node:fs/promises');

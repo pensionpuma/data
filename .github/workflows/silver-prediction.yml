@@ -31,23 +31,23 @@ jobs:
           fi
 
       - name: Checkout repo
-        if: steps.gate.outputs.proceed == 'true'
+        # if: steps.gate.outputs.proceed == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Set up Python
-        if: steps.gate.outputs.proceed == 'true'
+        # if: steps.gate.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        if: steps.gate.outputs.proceed == 'true'
+        # if: steps.gate.outputs.proceed == 'true'
         run: pip install requests
 
       - name: Run prediction and push
-        if: steps.gate.outputs.proceed == 'true'
+        # if: steps.gate.outputs.proceed == 'true'
         env:
           METALCHARTS_API_KEY: ${{ secrets.METALCHARTS_API_KEY }}
         run: python predict_silver.py

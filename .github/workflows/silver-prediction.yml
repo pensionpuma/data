@@ -1,0 +1,53 @@
+name: Daily Silver Prediction
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC only and does not observe DST, so we
+    # trigger at BOTH 05:30 UTC (covers 06:30 BST, roughly late Mar-late Oct)
+    # and 06:30 UTC (covers 06:30 GMT, roughly late Oct-late Mar).
+    # The script checks the actual Europe/London time and only proceeds
+    # on the run that lands at 06:30 UK time, so only one run per day
+    # actually writes to silver.txt.
+    - cron: "30 5 * * 1-5"
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch: {}   # allows manual trigger for testing
+
+permissions:
+  contents: write   # lets the default GITHUB_TOKEN push the commit back
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check it's actually 06:30 UK time
+        id: gate
+        run: |
+          UK_TIME=$(TZ="Europe/London" date +%H:%M)
+          echo "Current UK time: $UK_TIME"
+          if [ "$UK_TIME" = "06:30" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        run: pip install requests
+
+      - name: Run prediction and push
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python predict_silver.py

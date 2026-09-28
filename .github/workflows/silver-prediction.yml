@@ -2,12 +2,11 @@ name: Daily Silver Prediction
 
 on:
   schedule:
-    # GitHub Actions cron is UTC only and does not observe DST, so we
-    # trigger at BOTH 05:30 UTC (covers 06:30 BST, roughly late Mar-late Oct)
-    # and 06:30 UTC (covers 06:30 GMT, roughly late Oct-late Mar).
-    # The script checks the actual Europe/London time and only proceeds
-    # on the run that lands at 06:30 UK time, so only one run per day
-    # actually writes to silver.txt.
+    # GitHub Actions cron is UTC only and ignores UK daylight saving, so
+    # we trigger at BOTH 05:30 UTC (= 06:30 BST) and 06:30 UTC (= 06:30 GMT).
+    # Scheduled runs are often delayed by many minutes, so the gate below
+    # checks the UK *hour* (06 or 07), not an exact minute. The script
+    # itself refuses to write a second line for the same UK date.
     - cron: "30 5 * * 1-5"
     - cron: "30 6 * * 1-5"
   workflow_dispatch: {}   # allows manual trigger for testing
@@ -19,12 +18,15 @@ jobs:
   predict:
     runs-on: ubuntu-latest
     steps:
-      - name: Check it's actually 06:30 UK time
+      - name: Gate on UK time window
         id: gate
         run: |
           UK_TIME=$(TZ="Europe/London" date +%H:%M)
-          echo "Current UK time: $UK_TIME"
-          if [ "$UK_TIME" = "06:30" ]; then
+          UK_HOUR=$(TZ="Europe/London" date +%H)
+          echo "Event: ${{ github.event_name }} | Current UK time: $UK_TIME"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"   # manual runs always go
+          elif [ "$UK_HOUR" = "06" ] || [ "$UK_HOUR" = "07" ]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           else
             echo "proceed=false" >> "$GITHUB_OUTPUT"
